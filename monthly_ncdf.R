@@ -1,3 +1,5 @@
+# 22-07-2024
+# to aggregate daily data from eobs as monthly, with the monthly mean and the standard deviation of the mean in the aggregated files.
 library(ncdf4)
 library(lubridate)
 
@@ -79,7 +81,8 @@ write_nc_file <- function(file_path, data, aggregated_data) {
 }
 
 # Directory dei file NetCDF di input
-input_directory <- "/Users/fabiomadonna/Desktop/dataset-insitu-gridded-observations-europe-27dd8487-1b09-417a-9645-7fcbad5dcc8f/eobs"
+input_directory <- "/Users/fabiomadonna/Desktop/Cartelle/PROGETTI/PNRR/SMICRAB/dataset-insitu-gridded-observations/eobs"
+
 
 # Leggi tutti i file NetCDF nella directory
 nc_files <- list.files(input_directory, pattern = "\\.nc$", full.names = TRUE)
