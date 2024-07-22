@@ -1,7 +1,7 @@
 import cdsapi
 
 c = cdsapi.Client()
-
+key= '2548:a32dce56-b04a-42fc-8fc3-a972f94772ad', progress=True,retry_max=5)  
 c.retrieve(
     'insitu-gridded-observations-europe',
     {
