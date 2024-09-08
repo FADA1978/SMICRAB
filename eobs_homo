@@ -1,0 +1,729 @@
+# Caricamento dei pacchetti necessari
+necessary_packages <- c("akima", "ncdf4", "strucchange", "dplyr", "lubridate", "forecast", "trend", "zoo", "stats", "mblm", "spdep")
+
+installed_packages <- rownames(installed.packages())
+
+for (pkg in necessary_packages) {
+    if (!(pkg %in% installed_packages)) {
+        install.packages(pkg)
+    }
+    library(pkg, character.only = TRUE)
+}
+
+# Funzione per convertire mesi in secondi dal 1-1-1900
+convert_months_to_seconds <- function(months_from_2011) {
+    start_date <- ymd("2011-01-01")
+    target_date <- start_date %m+% months(months_from_2011)
+    reference_date <- ymd("1900-01-01")
+    difference_in_seconds <- as.numeric(difftime(target_date, reference_date, units = "secs"))
+    return(difference_in_seconds)
+}
+
+# Funzione per leggere il dataset grigliato EOBS
+read_grid_data <- function(file_path, var_name = "tg_monthly_mean") {
+    nc <- nc_open(file_path)
+    data <- ncvar_get(nc, var_name)
+    data <- data + 273.15  # Converti da °C a K
+    lon <- ncvar_get(nc, "longitude")
+    lat <- ncvar_get(nc, "latitude")
+    time <- ncvar_get(nc, "time")
+    time_units <- ncatt_get(nc, "time", "units")$value
+    months_from_2011 <- time
+    time <- convert_months_to_seconds(months_from_2011)
+    nc_close(nc)
+    list(data = data, lon = lon, lat = lat, time = time)
+}
+
+# Funzione per leggere il dataset grigliato ERA5
+read_grid_data1 <- function(file_path, var_name = "t2m") {
+    nc <- nc_open(file_path)
+    data <- ncvar_get(nc, var_name)
+    lon <- ncvar_get(nc, "longitude")
+    lat <- ncvar_get(nc, "latitude")
+    time <- ncvar_get(nc, "time")
+    time_units <- ncatt_get(nc, "time", "units")$value
+    time <- time * 3600  # Converte le ore in secondi
+    nc_close(nc)
+    list(data = data, lon = lon, lat = lat, time = time)
+}
+
+# Funzione per estrarre la serie temporale di un punto della griglia
+extract_time_series <- function(data, lon_idx, lat_idx) {
+	
+    ts_data <- data[lon_idx, lat_idx, ]
+    
+    # Gestione dei valori mancanti nella serie temporale
+    if (all(is.na(ts_data))) {
+        warning(paste("Tutti i valori sono mancanti a lon_idx:", lon_idx, "lat_idx:", lat_idx))
+        return(NULL)
+    }
+    
+    if (any(is.na(ts_data))) {
+        warning(paste("Valori mancanti rilevati a lon_idx:", lon_idx, "lat_idx:", lat_idx))
+        ts_data <- zoo::na.approx(ts_data, na.rm = FALSE)
+    }
+    
+    ts_data <- na.omit(ts_data)  # Rimuove eventuali NA rimanenti dopo l'interpolazione
+
+    if (length(ts_data) < 2) {
+        warning(paste("Serie temporale troppo corta a lon_idx:", lon_idx, "lat_idx:", lat_idx))
+        return(NULL)
+    }
+
+    ts(ts_data, frequency = 12)
+}
+
+# Funzione per gestire i valori NA, interpolando o imputando se necessario
+# handle_na_values <- function(ts_data) {
+    # if (all(is.na(ts_data))) {
+        # return(NULL)  # Restituisci NULL se tutta la serie è NA
+    # }
+    
+    # # Interpolazione lineare per i valori mancanti
+    # ts_data_interpolated <- na.approx(ts_data, na.rm = FALSE)
+    
+    # return(ts_data_interpolated)
+# }
+
+# Funzione per identificare e gestire outliers
+handle_outliers <- function(ts_data, threshold = 3) {
+    ts_mean <- mean(ts_data, na.rm = TRUE)
+    ts_sd <- sd(ts_data, na.rm = TRUE)
+    
+    # Identifica outliers come valori oltre threshold deviazioni standard dalla media
+    outliers <- abs(ts_data - ts_mean) > threshold * ts_sd
+    
+    # Sostituisci gli outliers con la media
+    ts_data[outliers] <- ts_mean
+    
+    return(ts_data)
+}
+
+# Funzione per calcolare il trend mensile
+# Funzione per calcolare il trend mensile
+calculate_monthly_trend <- function(dates_corrected_data, corrected_data) {
+  # Controlla se le lunghezze sono uguali
+  if (length(dates_corrected_data) != length(corrected_data)) {
+    warning(paste("Le lunghezze di 'dates_corrected_data' e 'corrected_data' non corrispondono:",
+                  length(dates_corrected_data), "vs", length(corrected_data)))
+    
+    # Sincronizza le lunghezze per evitare errori
+    min_length <- min(length(dates_corrected_data), length(corrected_data))
+    
+    # Taglia entrambi i vettori alla lunghezza minima
+    dates_corrected_data <- dates_corrected_data[1:min_length]
+    corrected_data <- corrected_data[1:min_length]
+  }
+
+  # Crea un dataframe con le date e i dati corretti
+  data_df <- data.frame(date = dates_corrected_data, value = corrected_data)
+
+  # Rimuove eventuali NA
+  data_df <- na.omit(data_df)
+
+  # Verifica se ci sono dati sufficienti per l'aggregazione
+  if (nrow(data_df) == 0) {
+    warning("Nessun dato disponibile per calcolare il trend mensile.")
+    return(NA)  # Ritorna NA se non ci sono dati da aggregare
+  }
+
+  # Aggrega i dati per mese e calcola la media per ciascun mese
+  data_df$date <- as.Date(data_df$date)  # Converte le date in formato Date
+  data_df$year_month <- format(data_df$date, "%Y-%m")
+
+  # Verifica che ci siano dati aggregati
+  if (length(unique(data_df$year_month)) == 0) {
+    warning("Nessun dato disponibile dopo l'aggregazione per calcolare il trend mensile.")
+    return(NA)  # Ritorna NA se non ci sono dati unici per year_month
+  }
+
+  # Aggrega per year_month
+  monthly_data <- aggregate(value ~ year_month, data = data_df, FUN = mean)
+
+  # Controlla se ci sono dati sufficienti per la regressione
+  if (nrow(monthly_data) < 2) {
+    warning("Dati insufficienti per la regressione lineare.")
+    return(NA)  # Ritorna NA se ci sono meno di 2 punti dati per il trend
+  }
+
+  # Aggiunge una variabile numerica per il mese
+  monthly_data$month_num <- as.numeric(as.factor(monthly_data$year_month))
+
+  # Calcola il trend lineare usando lm (modello lineare)
+  trend_model <- lm(value ~ month_num, data = monthly_data)
+
+  # Estrae il coefficiente del trend (pendenza)
+  slope <- coef(trend_model)[2]
+
+  return(slope)
+}
+# detect_break_points_stl <- function(ts_data) {
+    # print("Debug Info: Inizio della rilevazione dei breakpoints STL.")
+    
+    # # Verifica della lunghezza della serie temporale
+    # ts_length <- length(ts_data)
+    # print(paste("Lunghezza della serie temporale:", ts_length))
+    
+    # if (ts_length < 24) {  # Assumendo un minimo di 2 anni di dati mensili per una stima affidabile
+        # warning("Serie temporale troppo corta per rilevare i breakpoints.")
+        # return(NULL)
+    # }
+    
+    # tryCatch({
+        # stl_decomp <- stl(ts_data, s.window = "periodic")
+        
+        # trend_component <- stl_decomp$time.series[, "trend"]
+        # print(trend_component)
+        # print("Debug Info: Decomposizione STL completata.")
+        
+        # # Verifica della presenza di NA nella componente trend
+        # if (any(is.na(trend_component))) {
+            # warning("Componente trend contiene valori NA. Breakpoints non rilevabili.")
+            # return(NULL)
+        # }
+        
+
+  # # Controlla la lunghezza e i valori della serie temporale
+  # if (length(trend_component) < 2) {
+    # stop("La serie temporale è troppo corta per calcolare i breakpoints.")
+  # }
+  
+  # # Controlla se ci sono valori NA
+  # if (any(is.na(trend_component))) {
+    # stop("La serie temporale contiene valori NA, che devono essere rimossi o interpolati.")
+  # }
+  
+  # # Calcola i breakpoints con gestione degli errori
+  # bp <- tryCatch({
+    # breakpoints(trend_component ~ 1, h = 0.15)
+  # }, error = function(e) {
+    # message("Errore nel calcolo dei breakpoints: ", e$message)
+    # return(NULL)
+  # })
+  
+  # # Controlla se `bp` è NULL o contiene breakpoints non validi
+  # if (is.null(bp) || all(is.na(bp$breakpoints))) {
+    # message("Nessun breakpoint valido trovato.")
+    # return(NULL)
+  # }
+
+
+        
+        # print(paste("Numero di breakpoints rilevati:", length(bp$breakpoints)))
+        
+        # if (length(bp$breakpoints) == 0) {
+            # warning("Nessun breakpoint rilevato.")
+            # return(NULL)
+        # } else {
+            # print(paste("Breakpoints rilevati alle posizioni:", paste(bp$breakpoints, collapse = ", ")))
+        # }
+        
+        # return(bp)
+    # }, error = function(e) {
+        # warning("Errore durante la rilevazione dei breakpoints STL: ", e$message)
+        # return(NULL)
+    # })
+# }
+
+
+# Lettura dei dataset
+dataset_path <- "/Users/fabiomadonna/Desktop/Cartelle/PROGETTI/PNRR/SMICRAB/monthly_aggregation/tg_ens_mean_0.1deg_reg_2011-2023_v29.0e_IT_tg_monthly_agg.nc"
+era5_path <- "/Users/fabiomadonna/Desktop/Cartelle/PROGETTI/PNRR/SMICRAB/monthly_aggregation/ERA5_Land_monthly_2011_2024.nc"
+
+grid_data <- read_grid_data(dataset_path)
+era5_data <- read_grid_data1(era5_path)
+
+common_time <- intersect(grid_data$time, era5_data$time)
+common_indices_grid <- which(grid_data$time %in% common_time)
+common_indices_era5 <- which(era5_data$time %in% common_time)
+
+grid_data$data <- grid_data$data[,,common_indices_grid]
+grid_data$time <- grid_data$time[common_indices_grid]
+
+era5_data$data <- era5_data$data[,,1,common_indices_era5]
+era5_data$time <- era5_data$time[common_indices_era5]
+
+# Coordinate della griglia
+coords_list <- expand.grid(lon_idx = 1:length(grid_data$lon), lat_idx = 1:length(grid_data$lat))
+
+# # # Loop principale per elaborare i punti della griglia
+# for (i in 1:nrow(coords_list)) {
+
+    # print(paste("Elaborazione del punto", i, "su", nrow(coords_list)))
+    # result <- process_point(i, grid_data, era5_data, coords_list, corrected_data_def)
+    
+    # if (is.null(result)) {
+        # warning(paste("Punto non processato correttamente a lon_idx:", coords_list$lon_idx[i], 
+                      # "lat_idx:", coords_list$lat_idx[i]))
+    # }
+# }
+
+
+# # Modifica della funzione process_point per gestire i casi di serie temporali nulle
+# process_point <- function(i, grid_data, era5_data, coords_list, corrected_data_def) {
+    # lon_idx <- coords_list$lon_idx[i]
+    # lat_idx <- coords_list$lat_idx[i]
+  
+    # lon_val <- grid_data$lon[lon_idx]
+    # lat_val <- grid_data$lat[lat_idx]
+    
+    # era5_lon_idx <- find_nearest_idx(lon_val, era5_data$lon)
+    # era5_lat_idx <- find_nearest_idx(lat_val, era5_data$lat)
+    
+    # ts_data <- extract_time_series(grid_data$data, lon_idx, lat_idx)
+    # ref_ts_data <- extract_time_series(era5_data$data, era5_lon_idx, era5_lat_idx)
+    
+    # # Verifica se la serie temporale è valida
+    # if (is.null(ts_data) || all(is.na(ts_data)) || length(ts_data) < 2) {
+        # warning(paste("Dati mancanti o serie temporale troppo corta per lon_idx:", lon_idx, "lat_idx:", lat_idx))
+        # return(NULL)
+    # }
+    
+    # bp <- detect_break_points_stl(ts_data)
+    
+    # # Se non ci sono breakpoints validi, non applicare correzioni
+    # if (!is.null(bp)) {
+        # corrected_ts <- apply_stl_innovation_correction(ts_data, ref_ts_data, bp)
+    # } else {
+        # corrected_ts <- ts_data  # Usa la serie temporale originale se non ci sono breakpoints
+    # }
+    
+    # # Verifica se i dati corretti sono validi prima di scrivere nel file NetCDF
+    # if (is.null(corrected_ts) || all(is.na(corrected_ts))) {
+        # warning(paste("Nessun dato valido per lon_idx:", lon_idx, "lat_idx:", lat_idx))
+        # return(NULL)
+    # }
+    
+    # # Scrittura dei dati corretti nel file NetCDF
+    # ncvar_put(nc_out, corrected_data_def, corrected_ts, start = c(lon_idx, lat_idx, 1), count = c(1, 1, length(corrected_ts)))
+    
+    # trend <- calculate_trend(corrected_ts)
+    
+    # return(list(lon_idx = lon_idx, lat_idx = lat_idx, corrected_ts = corrected_ts, trend = trend))
+# }
+
+# Funzione per trovare l'indice di una coordinata nella griglia
+find_nearest_idx <- function(coord, grid) {
+    return(which.min(abs(grid - coord)))
+}
+
+# Funzione per applicare la correzione basata sui breakpoints
+# # Funzione per applicare la correzione basata sui breakpoints
+# apply_stl_innovation_correction <- function(ts_data, ref_ts_data, bp) {
+  # n_segments <- length(bp$breakpoints) + 1
+   
+  # print("Debug Info: Inizio della correzione STL con Innovation.")
+  # print(paste("Lunghezza della serie temporale:", length(ts_data)))
+  # print(paste("Numero di segmenti:", n_segments))
+  
+  # for (i in 1:n_segments) {
+    # # Calcolo degli indici di inizio e fine per ciascun segmento
+    # start_idx <- ifelse(i == 1, 1, bp$breakpoints[i - 1] + 1)
+    # end_idx <- ifelse(i == n_segments, length(ts_data), bp$breakpoints[i])
+    
+    # # Controlla se gli indici sono validi
+    # if (start_idx > end_idx || start_idx > length(ts_data) || end_idx < 1) {
+      # warning(paste("Indici non validi: start_idx =", start_idx, "end_idx =", end_idx, "nel segmento", i))
+      # next
+    # }
+    
+    # print(paste("Segmento", i, ":", "Start index =", start_idx, "End index =", end_idx))
+    
+    # # Creazione delle finestre delle serie temporali con validazione degli indici
+    # ts_segment <- tryCatch(
+      # window(ts_data, start = start_idx, end = end_idx),
+      # error = function(e) {
+        # warning(paste("Errore nella creazione del window di ts_data:", e$message))
+        # return(NULL)
+      # }
+    # )
+    # ref_segment <- tryCatch(
+      # window(ref_ts_data, start = start_idx, end = end_idx),
+      # error = function(e) {
+        # warning(paste("Errore nella creazione del window di ref_ts_data:", e$message))
+        # return(NULL)
+      # }
+    # )
+    
+    # # Gestione del caso di segmenti troppo corti o nulli
+    # if (is.null(ts_segment) || is.null(ref_segment) || length(ts_segment) < 2 || length(ref_segment) < 2) {
+      # warning(paste("Segmento troppo corto o nullo per la decomposizione STL nel segmento", i, "da", start_idx, "a", end_idx))
+      # next
+    # }
+    
+    # print(paste("Debug Info: Lunghezza ts_segment =", length(ts_segment)))
+    # print(paste("Debug Info: Lunghezza ref_segment =", length(ref_segment)))
+    
+    # tryCatch({
+      # # Decomposizione STL del segmento
+      # stl_decomp <- stl(ts_segment, s.window = "periodic")
+      # trend_corrected <- stl_decomp$time.series[, "trend"] + (mean(ref_segment, na.rm = TRUE) - mean(ts_segment, na.rm = TRUE))
+      
+      # # Verifica la lunghezza della correzione rispetto all'intervallo di sostituzione
+      # if (length(trend_corrected) != (end_idx - start_idx + 1)) {
+        # warning(paste("Lunghezza del trend_corrected non corrisponde all'intervallo di sostituzione nel segmento", i))
+        # next
+      # }
+      
+      # # Assegna il segmento corretto alla serie temporale finale
+      # ts_data_def[start_idx:end_idx] <- trend_corrected
+      
+      # print(paste("Correzione completata per il segmento", i))
+    # }, error = function(e) {
+      # warning(paste("Errore durante la decomposizione STL nel segmento", i, ":", e$message))
+    # })
+  # }
+  
+  # print("Debug Info: Fine della correzione STL con Innovation.")
+  # return(ts_data_def)
+# }
+
+# Funzione di plotting aggiornata per salvare i PNG
+
+plot_time_series <- function(ts_data, corrected_ts, title, lon_val, lat_val, output_dir) {
+    file_name <- paste0("plot_lon_", lon_val, "_lat_", lat_val, ".png")
+    file_path <- paste0(output_dir,"/", file_name)
+     
+    setwd(output_dir)
+    png(file_path, width = 800, height = 600)
+
+    plot(as.vector(ts_data), col = "red", lwd = 2, type="l", ylab = "Temperature (K)", xlab = "Time", main = title)
+    lines(corrected_ts, col = "blue", lwd = 2)
+    legend("topright", legend = c("Original", "Corrected"), col = c("red", "blue"), lty = 1, lwd = 2)
+	
+	dev.off()
+    print(paste("Grafico salvato in:", file_path))
+}
+
+
+snht_threshold <- function(ts_data, common_time) {
+ 
+	# Calcolo del trend usando LOESS (Local Regression)
+	loess_model <- loess(ts_data ~ common_time, span = 0.3) # 'span' controlla il grado di smussamento
+
+	# Estrai il trend stimato
+	trend_loess <- predict(loess_model)
+
+# Passo 1: Calcolo dell'autocorrelazione temporale (ACF)
+acf_values <- acf(trend_loess, plot = FALSE)  # Calcola l'ACF senza visualizzarlo
+
+# Passo 2: Calcolo dell'autocorrelazione spaziale
+# Supponiamo di avere una griglia di 10x10 per i dati spaziali
+# Serie temporale di input con lunghezza n
+n <- length(trend_loess)  # Assumi che ts_data sia già definita
+
+# Trova la dimensione della griglia approssimativamente quadrata
+grid_size <- ceiling(sqrt(n))
+
+# Crea coordinate per la griglia (arrotonda in eccesso per coprire tutti i punti)
+coords <- cbind(rep(1:grid_size, each = grid_size)[1:n], rep(1:grid_size, times = grid_size)[1:n])
+
+# Costruisci la struttura di vicinato basata sul k-nearest neighbors (4 vicini)
+nb <- knn2nb(knearneigh(coords, k = 4))
+
+# Converti la struttura di vicinato in un oggetto 'listw'
+listw <- nb2listw(nb)
+
+# Esegui il test di Moran
+moran_I <- moran.test(trend_loess, listw)
+
+# Stampa il risultato
+print(moran_I)# Passo 3: Generazione di serie simulate (Monte Carlo)
+n_simulations <- 30  # Numero di simulazioni
+simulated_T_max <- numeric(n_simulations)
+
+for (i in 1:n_simulations) {
+  # Genera serie temporali simulate mantenendo l'autocorrelazione
+  simulated_series <- arima.sim(model = list(ar = acf_values$acf[2]), n = n)
+
+# Lunghezza del filtro (ad esempio, una finestra di 5 punti)
+filter_length <- min(5, length(simulated_series)) # La lunghezza del filtro non può superare la lunghezza della serie
+
+# Definisce il filtro come una media mobile inversamente proporzionale all'indice di Moran
+filter_weights <- rep(1 / moran_I$estimate, filter_length)
+
+# Assicurati di usare la funzione filter del pacchetto stats
+simulated_series_filtered <- stats::filter(simulated_series, filter = filter_weights, sides = 1)
+
+  
+  # Esegui il test SNHT su ciascuna serie simulata
+  test_result <- snh.test(simulated_series)
+  T_max_sim <- max(test_result$statistic)
+  simulated_T_max[i] <- T_max_sim
+}
+
+
+# Passo 4: Calcolo dei valori critici
+threshold_snht <- quantile(simulated_T_max, probs = 0.95)
+
+# Stampa il valore critico
+cat("Valore critico corretto (95%):", threshold_snht, "\n")
+return(threshold_snht)
+}
+
+homo_neighbors <- function(ts_data, common_time, window_size, threshold_snht) {
+	
+  # Convertire i dati in formato numerico
+  ts_data <- as.numeric(ts_data)
+  
+  # Serie di output
+  ts_data_def <- ts_data
+  print(ts_data_def)
+  
+	# Calcolo del trend usando LOESS (Local Regression)
+	loess_model <- loess(ts_data ~ common_time, span = 0.3) # 'span' controlla il grado di smussamento
+
+	# Estrai il trend stimato
+	trend_loess <- predict(loess_model)
+
+
+  # Calcolare la serie di background come media mobile dei vicini
+  bg_series <- zoo::rollapply(ts_data, width = window_size, FUN = mean, align = "center", fill = NA)
+  
+  # Calcolo dell'SNHT
+  n <- length(ts_data)
+  snht_values <- rep(NA, n)
+  
+  # Eseguire il ciclo solo se la finestra è valida
+  for (i in (window_size + 1):(n - window_size)) {
+    if (i - window_size >= 1 && i + window_size <= n) {
+      # Seleziona i segmenti da analizzare
+      segment1 <- trend_loess[(i - window_size):(i - 1)]
+      segment2 <- trend_loess[(i + 1):(i + window_size)]
+      total_segment <- c(segment1, segment2)
+      
+      # Calcolare le medie e la deviazione standard
+      mean1 <- mean(segment1, na.rm = TRUE)
+      mean2 <- mean(segment2, na.rm = TRUE)
+      mean_total <- mean(total_segment, na.rm = TRUE)
+      sd_total <- sd(total_segment, na.rm = TRUE)
+      
+      # Calcolo del valore di SNHT
+      snht_values[i] <- (length(segment1))*((mean1-mean_total) / sd_total) ^ 2 + (length(segment1))*((mean2-mean_total) / sd_total) ^ 2
+      print(paste(snht_values))#, window_size, n - window_size, mean1, mean2, mean_total))
+    }
+  }
+  
+  # Identificazione dei Breakpoint usando il valore di soglia di SNHT
+  breakpoints <- which(snht_values > threshold_snht)
+  
+  # Correzione dei Breakpoint con il Metodo Nearest-Neighbor
+  for (bp in breakpoints) {
+    if (bp > 1 && bp < length(ts_data)) {
+      # Sostituisce il valore anomalo con la media dei vicini
+      ts_data_def[bp] <- mean(c(ts_data[bp - 1], ts_data[bp + 1]), na.rm = TRUE)
+    } else if (bp > 1) {
+      # Se solo il valore precedente è disponibile
+      ts_data_def[bp] <- ts_data[bp - 1]
+    } else {
+      # Se solo il valore successivo è disponibile
+      ts_data_def[bp] <- ts_data[bp + 1]
+    }
+  }
+  
+  return(list(corrected_data = ts_data_def, snht_values = snht_values, breakpoints = breakpoints))
+}
+
+# Carica i pacchetti necessari
+if (!require(forecast)) install.packages("forecast")
+library(forecast)
+
+# Funzione aggiornata homo_neighbors con ARIMA per il rilevamento dei breakpoints
+homo_neighbors_arima <- function(ts_data, ts_data_def, threshold_sd = 2) {
+  # Converte la serie temporale in un formato numerico
+  ts_data <- as.numeric(ts_data)
+  
+  # Adatta un modello ARIMA alla serie temporale
+  arima_model <- auto.arima(ts_data)
+  
+  # Calcola i residui del modello ARIMA
+  residuals_arima <- residuals(arima_model)
+  
+  # Calcola la deviazione standard dei residui
+  sd_residuals <- sd(residuals_arima, na.rm = TRUE)
+  
+  # Identificazione dei breakpoints: trova dove i residui superano una soglia di deviazione standard
+  breakpoints <- which(abs(residuals_arima) > threshold_sd * sd_residuals)
+  
+  # Creare una copia dei Breakpoint Originali per confronto
+  original_breakpoints <- ts_data[breakpoints + 1]
+  
+  # Correzione dei Breakpoint con il Metodo Nearest-Neighbor
+  for (bp in breakpoints) {
+    if (bp > 1 && bp < length(ts_data)) {
+      # Sostituisce il valore anomalo con la media dei vicini
+      ts_data_def[bp + 1] <- mean(c(ts_data[bp], ts_data[bp + 2]), na.rm = TRUE)
+    } else if (bp > 1) {
+      # Se solo il valore precedente è disponibile
+      ts_data_def[bp + 1] <- ts_data[bp]
+    } else {
+      # Se solo il valore successivo è disponibile
+      ts_data_def[bp + 1] <- ts_data[bp + 2]
+    }
+  }
+
+  # Ritorna i dati corretti
+  return(list(corrected_data = ts_data_def, original_data = ts_data, sd_residuals = sd_residuals, breakpoints = breakpoints))
+}
+
+# Funzione aggiornata homo_neighbors con ARIMA per il rilevamento dei breakpoints
+homo_neighbors_arima <- function(ts_data, threshold_sd=2) {
+  # Converte la serie temporale in un formato numerico
+  ts_data <- as.numeric(ts_data)
+  ts_data_def1<-ts_data
+  # Adatta un modello ARIMA alla serie temporale
+  arima_model <- auto.arima(ts_data)
+
+  # Calcola i residui del modello ARIMA
+  residuals_arima <- residuals(arima_model)
+  
+  # Calcola la deviazione standard dei residui
+  sd_residuals <- sd(residuals_arima, na.rm = TRUE)
+  
+  # Identificazione dei breakpoints: trova dove i residui superano una soglia di deviazione standard
+  breakpoints <- which(abs(residuals_arima) > threshold_sd * sd_residuals)
+  
+  # Creare una copia dei Breakpoint Originali per confronto
+  original_breakpoints <- ts_data[breakpoints + 1]
+
+  # Correzione dei Breakpoint con il Metodo Nearest-Neighbor
+  for (bp in breakpoints) {
+    if (bp > 1 && bp < length(ts_data)) {
+      # Sostituisce il valore anomalo con la media dei vicini
+      ts_data_def1[bp + 1] <- mean(c(ts_data[bp], ts_data[bp + 2]), na.rm = TRUE)
+    } else if (bp > 1) {
+      # Se solo il valore precedente è disponibile
+      ts_data_def1[bp + 1] <- ts_data[bp]
+    } else {
+      # Se solo il valore successivo è disponibile
+      ts_data_def1[bp + 1] <- ts_data[bp + 2]
+    }
+  }
+  
+  # Ritorna i dati corretti
+  return(list(corrected_data = ts_data_def1, original_data = ts_data, sd_residuals = sd_residuals, breakpoints = breakpoints))
+}
+
+# Funzione per salvare i dati corretti in un file NetCDF
+save_to_netcdf <- function(netcdf_file, ts_data, corrected_data, grid_data, common_time) {
+    # Definizione delle dimensioni
+    lon_dim <- ncdim_def(name = "longitude", units = "degrees_east", vals = grid_data$lon)
+    lat_dim <- ncdim_def(name = "latitude", units = "degrees_north", vals = grid_data$lat)
+    time_dim <- ncdim_def(name = "time", units = "seconds since 1900-01-01 00:00:00", vals = common_time)
+    
+    # Definizione delle variabili NetCDF
+    original_var_def <- ncvar_def(name = "original_data", units = "K", dim = list(lon_dim, lat_dim, time_dim), prec = "double")
+    corrected_var_def <- ncvar_def(name = "corrected_data", units = "K", dim = list(lon_dim, lat_dim, time_dim), prec = "double")
+    
+    # Creazione del file NetCDF
+    nc_out <- nc_create(netcdf_file, vars = list(original_var_def, corrected_var_def))
+    
+    # Verifica se il file è stato creato correttamente
+    if (is.null(nc_out$id)) {
+        stop("Errore nella creazione del file NetCDF. Controlla il percorso e i permessi del file.")
+    }
+    
+    # Scrittura dei dati nel file NetCDF
+    ncvar_put(nc_out, varid = original_var_def, vals = ts_data)
+    ncvar_put(nc_out, varid = corrected_var_def, vals = corrected_data)
+    
+    # Chiusura del file NetCDF
+    nc_close(nc_out)
+    
+    message("Dati salvati con successo nel file NetCDF.")
+}
+
+# Definizione delle matrici di dati
+# Definizione delle matrici di dati
+ts_data_a <- array(NA, dim = c(length(grid_data$lon), length(grid_data$lat), length(common_time)))
+corrected_data_a <- array(NA, dim = c(length(grid_data$lon), length(grid_data$lat), length(common_time)))
+trend <- array(NA, dim = c(length(grid_data$lon), length(grid_data$lat)))
+
+# Elaborazione sequenziale dei punti della griglia
+for (i in 1:nrow(coords_list)) {
+    lon_idx <- coords_list$lon_idx[i]
+    lat_idx <- coords_list$lat_idx[i]
+    lon_val <- grid_data$lon[lon_idx]
+    lat_val <- grid_data$lat[lat_idx]
+    
+    era5_lon_idx <- find_nearest_idx(lon_val, era5_data$lon)
+    era5_lat_idx <- find_nearest_idx(lat_val, era5_data$lat)
+    
+    ts_data <- extract_time_series(grid_data$data, lon_idx, lat_idx)
+    era5_ts_data <- extract_time_series(era5_data$data, era5_lon_idx, era5_lat_idx)
+
+    # Controlla se ci sono almeno due osservazioni per entrambe le serie
+    if (length(ts_data) < 24 & length(era5_ts_data) < 24) {
+        warning(paste("Dati insufficienti per Lon:", lon_val, "Lat:", lat_val))
+        #original_data <- rep(NA, length(common_time))   # Riempi con NA se i dati sono insufficienti
+        corrected_data <- rep(NA, length(common_time))  # Riempi con NA se i dati sono insufficienti
+    } else {
+        # Unisce le due serie temporali
+        ts_data <- ts.union(ts_data, era5_ts_data)
+ 		ts_data <- handle_outliers(ts_data)
+        # Esegui la correzione dei dati
+        result <- homo_neighbors_arima(ts_data)
+
+        # Estrai i dati originali e corretti
+        original_data <- result$original_data
+        corrected_data <- result$corrected_data
+        	# Estrarre i valori SNHT calcolati
+			snht_values <- result$snht_values
+
+			# Estrarre gli indici dei breakpoint
+			bp <- result$breakpoints
+
+        # # Controlla che original_data abbia la lunghezza corretta
+        # if (length(original_data) != length(common_time)) {
+            # warning(paste("La lunghezza di original_data non corrisponde a common_time per Lon:", lon_val, "Lat:", lat_val))
+            # # Adatta la lunghezza di original_data a quella di common_time
+            # original_data <- rep(NA, length(common_time))
+            # corrected_data <- rep(NA, length(common_time))
+        # }
+    }
+
+    # # Generazione dei grafici
+    if (length(ts_data) > 24 & !is.null(bp)){
+     plot_time_series(ts_data, corrected_data, paste("Lon:", lon_val, "Lat:", lat_val), lon_val, lat_val, output_dir)
+     }
+  
+
+     # print("Serie temporale originale")
+     # print(original_data)
+     # print("Serie temporale corretta")
+     # print(corrected_data)
+    # print("Differenza")
+    # print(corrected_data-ts_data)
+    # print("Breakpoints")
+    # print(bp)  
+    
+
+    # Calcolo delle anomalie di trend
+    dates_corrected_data <- seq(as.Date("2011-01-01"), as.Date("2023-12-31"), by = "month")
+    slope_anomalies <- calculate_monthly_trend(dates_corrected_data, corrected_data)
+    trend[lon_idx, lat_idx] <- 120 * slope_anomalies
+
+    # Assegna i dati alle matrici, solo se le lunghezze corrispondono
+    #if (length(original_data) == length(ts_data_a[lon_idx, lat_idx, ])) {
+        ts_data_a[lon_idx, lat_idx, ] <- original_data[1:length(common_time)]
+    #} else {
+     #   warning(paste("Lunghezza dei dati da assegnare non corrisponde per Lon:", lon_val, "Lat:", lat_val))
+    #}
+
+	    # Assegna i dati alle matrici, solo se le lunghezze corrispondono
+    # if (length(corrected_data) == length(corrected_data_a[lon_idx, lat_idx, ])) {
+
+        corrected_data_a[lon_idx, lat_idx, ] <- corrected_data[1:length(common_time)]
+        
+    # } else {
+        # warning(paste("Lunghezza dei dati da assegnare non corrisponde per Lon:", lon_val, "Lat:", lat_val))
+    # }
+
+    # Log di debug
+    print(paste("Trend decennale calcolato per Lon:", lon_val, "Lat:", lat_val, ":", 120 * slope_anomalies))
+}
+
+# Salvataggio dei dati in un file NetCDF
+netcdf_file <- "/Users/fabiomadonna/Desktop/Cartelle/PROGETTI/PNRR/SMICRAB/monthly_aggregation/output/corrected_data.nc"
+save_to_netcdf(netcdf_file, ts_data_a, corrected_data_a, grid_data, common_time)
+
